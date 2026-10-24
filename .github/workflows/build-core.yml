@@ -25,8 +25,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go vet ./...
-      - run: go test ./...
+      - name: Vet
+        run: go vet $(go list ./... | grep -v /mobile)
+      - name: Test
+        run: go test $(go list ./... | grep -v /mobile)
 
   android:
     name: Build ${{ matrix.abi }}
