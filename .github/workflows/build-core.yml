@@ -1,0 +1,130 @@
+name: build-core
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test Go core
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test ./...
+
+  android:
+    name: Build ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            goarch: arm64
+            goarm: ""
+            cc: aarch64-linux-android24-clang
+          - abi: armeabi-v7a
+            goarch: arm
+            goarm: "7"
+            cc: armv7a-linux-androideabi24-clang
+          - abi: x86_64
+            goarch: amd64
+            goarm: ""
+            cc: x86_64-linux-android24-clang
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Locate Android NDK
+        shell: bash
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            NDK="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | sort -V | tail -1)"
+          fi
+          test -d "$NDK" || { echo "Android NDK not found"; exit 1; }
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          echo "Using NDK at $NDK"
+
+      - name: Build ${{ matrix.abi }}
+        shell: bash
+        env:
+          GOOS: android
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "1"
+        run: |
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          mkdir -p "dist/${{ matrix.abi }}"
+          CC="$TOOLCHAIN/bin/${{ matrix.cc }}" \
+            go build -tags netgo,osusergo -buildmode=c-shared -trimpath \
+              -ldflags="-s -w" \
+              -o "dist/${{ matrix.abi }}/libt3core.so" ./mobile
+          "${TOOLCHAIN}/bin/llvm-strip" --strip-unneeded "dist/${{ matrix.abi }}/libt3core.so" 2>/dev/null || true
+          ls -lh "dist/${{ matrix.abi }}/libt3core.so"
+
+      - name: Upload ${{ matrix.abi }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: libt3core-${{ matrix.abi }}
+          path: dist/${{ matrix.abi }}/libt3core.so
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download ABI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libt3core-*
+          path: dist
+          merge-multiple: false
+
+      - name: Rename assets
+        shell: bash
+        run: |
+          mkdir -p release
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            src="dist/libt3core-$abi/libt3core.so"
+            test -f "$src" || { echo "missing $src"; find dist -maxdepth 3 -type f; exit 1; }
+            cp "$src" "release/libt3core-$abi.so"
+          done
+          ls -lh release
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release/*.so \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "T3 Code core ${GITHUB_REF_NAME}" \
+            --notes "Android JNI libraries built from ${GITHUB_SHA}."
