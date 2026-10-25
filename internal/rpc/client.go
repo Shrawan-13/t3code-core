@@ -40,22 +40,22 @@ func (e *Error) Error() string {
 }
 
 type envelope struct {
-	Tag       string          `json:"_tag"`
-	ID        json.RawMessage `json:"id,omitempty"`
-	RequestID json.RawMessage `json:"requestId,omitempty"`
-	Method    string          `json:"tag,omitempty"`
-	Payload   json.RawMessage `json:"payload,omitempty"`
-	Headers   [][2]string     `json:"headers,omitempty"`
+	Tag       string            `json:"_tag"`
+	ID        json.RawMessage   `json:"id,omitempty"`
+	RequestID json.RawMessage   `json:"requestId,omitempty"`
+	Method    string            `json:"tag,omitempty"`
+	Payload   json.RawMessage   `json:"payload,omitempty"`
+	Headers   [][2]string       `json:"headers,omitempty"`
 	Values    []json.RawMessage `json:"values,omitempty"`
-	Exit      *exitEnvelope   `json:"exit,omitempty"`
-	Defect    json.RawMessage `json:"defect,omitempty"`
-	Error     json.RawMessage `json:"error,omitempty"`
+	Exit      *exitEnvelope     `json:"exit,omitempty"`
+	Defect    json.RawMessage   `json:"defect,omitempty"`
+	Error     json.RawMessage   `json:"error,omitempty"`
 }
 
 type exitEnvelope struct {
-	Tag   string       `json:"_tag"`
+	Tag   string          `json:"_tag"`
 	Value json.RawMessage `json:"value,omitempty"`
-	Cause []causeEntry `json:"cause,omitempty"`
+	Cause []causeEntry    `json:"cause,omitempty"`
 }
 
 type causeEntry struct {
@@ -67,6 +67,37 @@ type causeEntry struct {
 type pending struct {
 	ch     chan frame
 	stream bool
+
+	mu     sync.Mutex
+	closed bool
+}
+
+// trySend delivers one frame without blocking the socket read loop. A consumer
+// that cannot keep up must never stall unrelated RPC calls on the connection.
+func (p *pending) trySend(f frame) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
+	}
+	select {
+	case p.ch <- f:
+		return true
+	default:
+		return false
+	}
+}
+
+// close terminates the delivery channel. It is safe to call more than once
+// and from any goroutine.
+func (p *pending) close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	p.closed = true
+	close(p.ch)
 }
 
 // frame is one decoded server message for a request.
@@ -254,9 +285,17 @@ func (c *Client) handle(env *envelope) {
 		p := c.pending[id]
 		c.mu.Unlock()
 		if p != nil {
-			p.ch <- frame{Chunk: env.Values}
-			// Acknowledge so the server can free the chunk.
-			c.sendJSON(map[string]any{"_tag": "Ack", "requestId": json.RawMessage(env.RequestID)})
+			if p.trySend(frame{Chunk: env.Values}) {
+				// Acknowledge so the server can free the chunk.
+				c.sendJSON(map[string]any{"_tag": "Ack", "requestId": json.RawMessage(env.RequestID)})
+			} else {
+				// A subscription whose consumer stopped reading must not wedge
+				// the read loop. That would leave every other request on this
+				// connection waiting until its deadline and produce misleading
+				// "context deadline exceeded" failures. Tear the connection down
+				// so the app reconnects with fresh subscriptions instead.
+				c.fail(fmt.Errorf("rpc request %s is not being consumed", id))
+			}
 		}
 		return
 	case "Exit":
@@ -270,18 +309,19 @@ func (c *Client) handle(env *envelope) {
 		if p == nil {
 			return
 		}
-		if env.Exit == nil {
-			p.ch <- frame{Done: true}
-			close(p.ch)
+		f := frame{Done: true}
+		if env.Exit != nil {
+			f.Value = env.Exit.Value
+			if env.Exit.Tag != "Success" {
+				f.Err = decodeCause(env.Exit.Cause)
+			}
+		}
+		if !p.trySend(f) {
+			p.close()
+			c.fail(fmt.Errorf("rpc response for request %s is not being consumed", id))
 			return
 		}
-		if env.Exit.Tag == "Success" {
-			p.ch <- frame{Done: true, Value: env.Exit.Value}
-			close(p.ch)
-			return
-		}
-		p.ch <- frame{Done: true, Err: decodeCause(env.Exit.Cause)}
-		close(p.ch)
+		p.close()
 	}
 }
 
@@ -333,11 +373,8 @@ func (c *Client) fail(err error) {
 		_ = c.conn.Close(websocket.StatusNormalClosure, "")
 		c.mu.Lock()
 		for id, p := range c.pending {
-			select {
-			case p.ch <- frame{Done: true, Err: err}:
-			default:
-			}
-			close(p.ch)
+			p.trySend(frame{Done: true, Err: err})
+			p.close()
 			delete(c.pending, id)
 		}
 		c.mu.Unlock()
@@ -441,7 +478,7 @@ func (c *Client) start(ctx context.Context, method string, payload any) (*Stream
 	if err != nil {
 		return nil, err
 	}
-	p := &pending{ch: make(chan frame, 64), stream: true}
+	p := &pending{ch: make(chan frame, 256), stream: true}
 	c.mu.Lock()
 	c.pending[id] = p
 	c.mu.Unlock()
@@ -449,18 +486,31 @@ func (c *Client) start(ctx context.Context, method string, payload any) (*Stream
 	select {
 	case c.write <- data:
 	case <-c.ctx.Done():
-		return nil, c.Err()
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		p.close()
+		if err := c.Err(); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("connection closed")
 	case <-ctx.Done():
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		p.close()
 		return nil, ctx.Err()
 	}
 
 	s := &Stream{frames: p.ch}
 	s.cancel = func() {
 		c.mu.Lock()
-		_, ok := c.pending[id]
+		p, ok := c.pending[id]
 		delete(c.pending, id)
 		c.mu.Unlock()
 		if ok {
+			p.trySend(frame{Done: true, Err: context.Canceled})
+			p.close()
 			c.sendJSON(map[string]any{"_tag": "Interrupt", "requestId": id})
 		}
 	}

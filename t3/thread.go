@@ -33,12 +33,12 @@ type ThreadEvent struct {
 
 // ThreadWatcher maintains a live thread projection.
 type ThreadWatcher struct {
-	client  *Client
+	client   *Client
 	threadID string
 
-	mu     sync.RWMutex
-	state  ThreadState
-	partial bool
+	mu                 sync.RWMutex
+	state              ThreadState
+	partial            bool
 	latestLocalOrdinal *int
 
 	events chan ThreadEvent
@@ -82,6 +82,10 @@ func (c *Client) WatchThreadPartial(ctx context.Context, threadID string, afterS
 
 func (w *ThreadWatcher) run(ctx context.Context, stream *rpc.Stream) {
 	defer close(w.done)
+	// Closing a watcher cancels ctx, but the RPC stream has its own request
+	// slot. Cancel it here as well so the server stops publishing and the
+	// client stops buffering events for a subscription nobody will read.
+	defer stream.Cancel()
 	for {
 		values, done, err := stream.Next(ctx)
 		if err != nil || done {
@@ -97,16 +101,16 @@ func (w *ThreadWatcher) run(ctx context.Context, stream *rpc.Stream) {
 		}
 		for _, raw := range values {
 			var item struct {
-				Kind             string          `json:"kind"`
-				Sequence         int64           `json:"sequence"`
-				SnapshotSequence int64           `json:"snapshotSequence"`
-				Projection       *ThreadProjection `json:"projection"`
-				HistoryCursor    *string         `json:"historyCursor"`
-				HasMoreHistory   *bool           `json:"hasMoreHistory"`
-				LatestLocalTurnOrdinal *int      `json:"latestLocalTurnOrdinal"`
-				TurnItemsOmitLocalVisible bool  `json:"turnItemsOmitLocalVisible"`
-				Event            *DomainEvent    `json:"event"`
-				EventType        string          `json:"eventType"`
+				Kind                      string            `json:"kind"`
+				Sequence                  int64             `json:"sequence"`
+				SnapshotSequence          int64             `json:"snapshotSequence"`
+				Projection                *ThreadProjection `json:"projection"`
+				HistoryCursor             *string           `json:"historyCursor"`
+				HasMoreHistory            *bool             `json:"hasMoreHistory"`
+				LatestLocalTurnOrdinal    *int              `json:"latestLocalTurnOrdinal"`
+				TurnItemsOmitLocalVisible bool              `json:"turnItemsOmitLocalVisible"`
+				Event                     *DomainEvent      `json:"event"`
+				EventType                 string            `json:"eventType"`
 			}
 			if err := json.Unmarshal(raw, &item); err != nil {
 				continue

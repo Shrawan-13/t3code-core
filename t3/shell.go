@@ -37,11 +37,11 @@ type ShellEvent struct {
 
 // ShellWatcher maintains a live shell snapshot.
 type ShellWatcher struct {
-	client *Client
-	mu     sync.RWMutex
-	state  ShellSnapshot
+	client  *Client
+	mu      sync.RWMutex
+	state   ShellSnapshot
 	hasSnap bool
-	seq    int64
+	seq     int64
 
 	events chan ShellEvent
 	cancel context.CancelFunc
@@ -69,6 +69,10 @@ func (c *Client) WatchShell(ctx context.Context) (*ShellWatcher, error) {
 
 func (w *ShellWatcher) run(ctx context.Context, stream *rpc.Stream) {
 	defer close(w.done)
+	// Closing a watcher cancels ctx, but the RPC stream has its own request
+	// slot. Cancel it here as well so the server stops publishing and the
+	// client stops buffering events for a subscription nobody will read.
+	defer stream.Cancel()
 	for {
 		values, done, err := stream.Next(ctx)
 		if err != nil || done {
@@ -84,14 +88,14 @@ func (w *ShellWatcher) run(ctx context.Context, stream *rpc.Stream) {
 		}
 		for _, raw := range values {
 			var item struct {
-				Kind     string        `json:"kind"`
-				Sequence int64         `json:"sequence"`
-				Snapshot *ShellSnapshot `json:"snapshot"`
-				Project  *Project      `json:"project"`
-				ProjectID string       `json:"projectId"`
-				Thread   *ThreadShell  `json:"thread"`
-				ThreadID string        `json:"threadId"`
-				Location string        `json:"location"`
+				Kind      string         `json:"kind"`
+				Sequence  int64          `json:"sequence"`
+				Snapshot  *ShellSnapshot `json:"snapshot"`
+				Project   *Project       `json:"project"`
+				ProjectID string         `json:"projectId"`
+				Thread    *ThreadShell   `json:"thread"`
+				ThreadID  string         `json:"threadId"`
+				Location  string         `json:"location"`
 			}
 			if err := json.Unmarshal(raw, &item); err != nil {
 				continue
