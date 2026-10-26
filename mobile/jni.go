@@ -574,6 +574,20 @@ func Java_com_t3codes_core_Native_nativeRespond(env *C.JNIEnv, clazz C.jclass, h
 	return javaString(env, `{"ok":true}`)
 }
 
+//export Java_com_t3codes_core_Native_nativeDismissUserInput
+func Java_com_t3codes_core_Native_nativeDismissUserInput(env *C.JNIEnv, clazz C.jclass, handle C.jlong, threadID C.jstring, requestID C.jstring) C.jstring {
+	c, err := getClient(int64(handle))
+	if err != nil {
+		return javaString(env, errJSON(err))
+	}
+	ctx, cancel := ctxTimeout(60000)
+	defer cancel()
+	if err := c.DismissUserInput(ctx, goString(env, threadID), goString(env, requestID)); err != nil {
+		return javaString(env, errJSON(err))
+	}
+	return javaString(env, `{"ok":true}`)
+}
+
 //export Java_com_t3codes_core_Native_nativeThreadAction
 func Java_com_t3codes_core_Native_nativeThreadAction(env *C.JNIEnv, clazz C.jclass, handle C.jlong, threadID C.jstring, action C.jstring, value C.jstring) C.jstring {
 	c, err := getClient(int64(handle))

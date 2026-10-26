@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/t3tools/t3go/internal/rpc"
@@ -32,7 +33,11 @@ type ShellEvent struct {
 	Thread    *ThreadShell   `json:"thread,omitempty"`
 	ThreadID  string         `json:"threadId,omitempty"`
 	Archived  bool           `json:"archived,omitempty"`
-	Err       string         `json:"error,omitempty"`
+	// ResolvedRepositoryIdentityRoots marks a project-metadata refresh. Those
+	// snapshots intentionally carry empty thread lists and must not replace
+	// the live shell's threads.
+	ResolvedRepositoryIdentityRoots []string `json:"resolvedRepositoryIdentityRoots,omitempty"`
+	Err                             string   `json:"error,omitempty"`
 }
 
 // ShellWatcher maintains a live shell snapshot.
@@ -88,14 +93,15 @@ func (w *ShellWatcher) run(ctx context.Context, stream *rpc.Stream) {
 		}
 		for _, raw := range values {
 			var item struct {
-				Kind      string         `json:"kind"`
-				Sequence  int64          `json:"sequence"`
-				Snapshot  *ShellSnapshot `json:"snapshot"`
-				Project   *Project       `json:"project"`
-				ProjectID string         `json:"projectId"`
-				Thread    *ThreadShell   `json:"thread"`
-				ThreadID  string         `json:"threadId"`
-				Location  string         `json:"location"`
+				Kind                            string         `json:"kind"`
+				Sequence                        int64          `json:"sequence"`
+				Snapshot                        *ShellSnapshot `json:"snapshot"`
+				Project                         *Project       `json:"project"`
+				ProjectID                       string         `json:"projectId"`
+				Thread                          *ThreadShell   `json:"thread"`
+				ThreadID                        string         `json:"threadId"`
+				Location                        string         `json:"location"`
+				ResolvedRepositoryIdentityRoots []string       `json:"resolvedRepositoryIdentityRoots"`
 			}
 			if err := json.Unmarshal(raw, &item); err != nil {
 				continue
@@ -106,11 +112,28 @@ func (w *ShellWatcher) run(ctx context.Context, stream *rpc.Stream) {
 					continue
 				}
 				w.mu.Lock()
-				w.state = *item.Snapshot
-				w.hasSnap = true
-				w.seq = item.Snapshot.SnapshotSequence
+				if len(item.ResolvedRepositoryIdentityRoots) > 0 && w.hasSnap {
+					// The server emits a second, project-only snapshot while
+					// repository identities resolve. It deliberately has no
+					// threads; treating it as authoritative wipes the chat list.
+					merged := mergeShellProjectSnapshot(w.state, *item.Snapshot)
+					w.state = merged
+					w.emit(ShellEvent{
+						Kind:                            ShellEventSnapshot,
+						Snapshot:                        &merged,
+						ResolvedRepositoryIdentityRoots: append([]string(nil), item.ResolvedRepositoryIdentityRoots...),
+					})
+				} else {
+					w.state = *item.Snapshot
+					w.hasSnap = true
+					w.seq = item.Snapshot.SnapshotSequence
+					w.emit(ShellEvent{
+						Kind:                            ShellEventSnapshot,
+						Snapshot:                        item.Snapshot,
+						ResolvedRepositoryIdentityRoots: append([]string(nil), item.ResolvedRepositoryIdentityRoots...),
+					})
+				}
 				w.mu.Unlock()
-				w.emit(ShellEvent{Kind: ShellEventSnapshot, Snapshot: item.Snapshot})
 			case "synchronized":
 				w.emit(ShellEvent{Kind: ShellEventSynchronized})
 			case "project.updated":
@@ -227,13 +250,49 @@ func (w *ShellWatcher) WaitSnapshot(ctx context.Context) (*ShellSnapshot, error)
 func (w *ShellWatcher) upsertProjectLocked(p *Project, seq int64) {
 	for i := range w.state.Projects {
 		if w.state.Projects[i].ID == p.ID {
-			w.state.Projects[i] = *p
+			w.state.Projects[i] = retainRepositoryIdentity(w.state.Projects[i], *p)
 			w.bumpSeq(seq)
 			return
 		}
 	}
 	w.state.Projects = append(w.state.Projects, *p)
 	w.bumpSeq(seq)
+}
+
+// mergeShellProjectSnapshot applies an enrichment-only snapshot without
+// dropping threads. The server sends these after the authoritative snapshot so
+// project repository identities can resolve asynchronously.
+func mergeShellProjectSnapshot(previous, next ShellSnapshot) ShellSnapshot {
+	merged := previous
+	projects := append([]Project(nil), previous.Projects...)
+	for _, project := range next.Projects {
+		index := -1
+		for i := range projects {
+			if projects[i].ID == project.ID {
+				index = i
+				break
+			}
+		}
+		if index >= 0 {
+			projects[index] = retainRepositoryIdentity(projects[index], project)
+		} else {
+			projects = append(projects, project)
+		}
+	}
+	merged.Projects = projects
+	return merged
+}
+
+func retainRepositoryIdentity(previous, next Project) Project {
+	if isNullJSON(next.RepositoryIdentity) {
+		next.RepositoryIdentity = previous.RepositoryIdentity
+	}
+	return next
+}
+
+func isNullJSON(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed == "" || trimmed == "null"
 }
 
 func (w *ShellWatcher) removeProjectLocked(id string, seq int64) {

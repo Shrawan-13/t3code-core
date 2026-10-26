@@ -248,7 +248,32 @@ type TurnItem struct {
 	Input              json.RawMessage `json:"input,omitempty"`
 	Output             json.RawMessage `json:"output,omitempty"`
 	OutputOmitted      *bool           `json:"outputOmitted,omitempty"`
+	RequestID          string          `json:"requestId,omitempty"`
+	Questions          []UserInputQuestion `json:"questions,omitempty"`
+	QuestionAnswer     json.RawMessage `json:"questionAnswer,omitempty"`
+	ResponseMode       string          `json:"responseMode,omitempty"`
 	Raw                json.RawMessage `json:"-"`
+}
+
+// UserInputQuestion is the pending question carried by a user_input_request
+// turn item.
+type UserInputQuestion struct {
+	ID                string            `json:"id"`
+	Header            string            `json:"header"`
+	Question          string            `json:"question"`
+	Options           []UserInputOption `json:"options"`
+	MultiSelect       *bool             `json:"multiSelect,omitempty"`
+	AllowCustomAnswer *bool             `json:"allowCustomAnswer,omitempty"`
+	InitialAnswer     string            `json:"initialAnswer,omitempty"`
+	Required          *bool             `json:"required,omitempty"`
+}
+
+// UserInputOption is one option for a pending question.
+type UserInputOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	Value       string `json:"value,omitempty"`
+	Preview     string `json:"preview,omitempty"`
 }
 
 // UnmarshalJSON keeps both the typed view and the raw object.
